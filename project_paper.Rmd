@@ -1,0 +1,778 @@
+---
+title: "report_Tregubova"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+``` {r}
+options(warn=-1)
+library(vcdExtra)
+library(tidyverse)
+library(DescTools)
+library(dplyr)
+library(corrplot)
+library(car)
+library(zoo)
+library(sandwich)
+```
+
+In economics the Hedonic Pricing Method that assumes the possibility to explain price of product by the combination of its characteristics is often applied to predict property value. That sounds logical because properties do have big number of specific factors that influence on price such as number of rooms, space, technical equipement and furniture that we pay attention when agree on the price. At the same time, location of property also explain price variation: access to retail, transport, number of playgrounds all may increase or decrease the price depending on its values..
+
+Given this, the aim of the research is to estimate the ability of internal and geospatial factors explain the price of apartments in Moscow. By other words, the paper seeks to understand how well Hedonic pricing model fits Russian capital Housing market.
+
+The research consisted of three steps:
+1. At first, we identify the strength of relationships between property explaining variables such as number of rooms and year of construction and price of purchase.
+2. Next, we analyze external variables related to presence and remoteness of facilities in a district , pursuing to add value to increase prediction ability of internal factors.
+3. OLS regression is built and assumptions are justified to prove the quality of model
+
+#Dataset. Summarative statistic
+
+The analysis is performed on data of the biggest Russian bank Sberbank about mortgage deals made through the bank during the period 2011 till 2015. Dataset was openly available within Kaggle competition held in 2016. For the paper purposes only 'train' dataset was used because there is no intention to check the model stability over the time but to point out the variables the most influence the property pricing in Moscow.
+
+Dataset contains 30471 observations and 292 variables, among which by default the program detected 185 integer variables, 16 factors and 91 numeric variables. However during the further analysis we will transform several ordinal variables, mistakenly recognised as integers, into factors. Also, we do not have intention to analyze every valuable but only those of them that describe property or important characteristics of its location.
+
+```{r echo=FALSE}
+data_house<-read.delim('C://Users/Intra24/Desktop/Glasgow_uni/DA and QM/sberbank-russian-housing-market/train.csv', sep=',')
+print ('size of dataset:')
+dim(data_house)
+print ('types of columns:')
+table(sapply(data_house, class))
+```
+All features represent two big groups, one of each is a range of property parametres such as area or floor and another is external factors such as number of cafes or public transport accessability. At each stage we will work separately with variables from one of this groups.
+
+Each observaion represesents the unique purchase transaction made in period 2011-2015 that could be an acquisition of a property either for investing or living there. In our data the type of purchase is presented in product_type variable.
+
+```{r echo=FALSE}
+data_house$year<-as.integer(format(as.Date(data_house$timestamp, format = "%Y-%m-%d"),"%Y"))
+length(unique(data_house$id))==dim(data_house)
+
+mean(is.na(data_house$product_type))
+
+data_house%>%
+  ggplot(aes(x=year, y =price_doc,group=product_type,  color=product_type))+
+  geom_line( stat='summary', fun.y='mean')+
+  theme_bw()+
+  ggtitle('Distribution of Mean price in year by product types ')+
+  theme(axis.title = element_text(size=14),axis.text = element_text(size=12))+xlab("Year of transaction")+ylab("Mean price")
+
+ggplot(data_house,aes(x=year))+
+geom_bar(aes(fill=product_type), position=position_dodge(), stat='count' )+
+ggtitle('Distribution of purchases per year')+
+
+theme_bw()+theme(axis.title = element_text(size=12) )+xlab("Timestamp per year")+ylab("Number of transactions")
+
+```
+Two things can be seen from these diagrams. First, product types have different levels of price where properties sold by owners are cheaper - we ignore the mean price of secondary housing in 2011 because of the very small amount of data available for this year. 
+In order to realize if this difference is statistically significant we perform Welch Two Sample t-test where null hypothesis is property prices of for investment and occupying purpose are the same.  Whilst the normality of distribution of analyzed variable is a main condition of running t-test, we take a logarithm of price, whose distribution is slightly left-skewed.
+```{r}
+
+data_house%>%ggplot(aes(x=price_doc))+geom_histogram(bins=50)+facet_grid(product_type~.)
+data_house%>%mutate(price_doc=log(price_doc))%>%ggplot(aes(x=price_doc))+geom_histogram(bins=50)+facet_grid(product_type~.)
+```
+Results of t-test where p-value is less than threshold 0.05 tell us to reject null hypothesis. Prices between both product types are different, so two models, each for one product type may give better results
+```{r}
+t.test(data_house%>%mutate(price_doc=log(price_doc))%>%filter(product_type=='Investment')%>%select(price_doc),data_house%>%mutate(price_doc=log(price_doc))%>%filter(product_type=='OwnerOccupier')%>%select(price_doc))
+```
+
+The second finding from the diagram of price distribution over purchase years is a nearly-linear growth of price  during the period in both product types. It means the steady historic growth of price may diminish the impact of other variables that are more important for us. To solve this issue and make price independable, we transform it by using linear equitation coefficients given from linear model.
+```{r echo=FALSE}
+#data_house<-data_house%>%mutate(year=as.factor(year))
+data_invest<-data_house%>%filter(product_type=='Investment')%>%
+  group_by(year)%>%summarize(mean_price=mean(price_doc))
+data_own<-data_house%>%filter(product_type=='OwnerOccupier', year>2011) %>%
+  group_by(year)%>%summarize(mean_price=mean(price_doc))
+
+lm_invest<-lm(data_invest$mean_price ~ data_invest$year)
+
+lm_own<-lm(data_own$mean_price ~ data_own$year)
+
+coef_inv<-lm_invest$coefficients[2]
+
+coef_own<-lm_own$coefficients[2]
+
+summary(lm_invest)
+summary(lm_own)
+
+```
+When we know coefficients and have a very high value or R-squared that confirms linearity between mean price and year, we can translate prices into basis using the formula: (price-intercept)/(year*slope)
+
+```{r}
+  data_house<-data_house%>%mutate(price_new=if_else(product_type=='Investment',(price_doc-lm_invest$coefficients[1])/(year*coef_inv), (price_doc-lm_own$coefficients[1])/(year*coef_own)))
+  data_house%>%
+  ggplot(aes(x=year, y =price_new,group=product_type,  color=product_type))+
+  geom_line( stat='summary', fun.y='mean')+
+  theme_bw()+
+  ggtitle('Distribution of Mean price in year by product types ')+
+  theme(axis.title = element_text(size=14),axis.text = element_text(size=12))+xlab("Year of transaction")+ylab("Mean price")
+
+```
+
+
+From this time we will use price_new as a target variable.
+
+```{r}
+data_house%>%
+  ggplot(aes(x=price_new*100))+
+  geom_density(color='blue', fill='blue')+
+  facet_grid(as.factor(product_type)~.)+
+  scale_x_continuous(limits=c(98.5,101.5))+
+  labs(x="Price",y="Count")
+```
+
+
+Next, data should be cleaned. We assume that it contains errors and missings that may worsen prediction quality. The most suitable way is to do it together with bivariate association analysis.
+
+#Analysis of explanatory variables describing property 
+
+Following the plan we start from analysing and transforming variables describing apartments themselves.
+
+```{r}
+
+property_vars<-c('full_sq', 'life_sq', 'floor','max_floor', 'max_floor', 'material', 'build_year', 'num_room','kitch_sq', 'state','product_type', 'sub_area'  )
+
+```
+
+
+First, we will test the ability of descibing property variables to explain its price and to make it done these variables should be cleaned as well as bivariate assocciations between all factors should be analysed.
+
+According to the diagram only two variables 'sub_area' and 'property_sq' do not have missings, all others need to be processed before using in regression. As variables are of different types, missings are treated separately.
+
+```{r}
+
+miss_percent_inv<-map_dbl(data_house%>%select(property_vars)%>%filter(product_type=='Investment'), function(x) { sum(is.na(x)) / length(x) * 100 })
+
+miss_percent_own<-map_dbl(data_house%>%select(property_vars)%>%filter(product_type=='OwnerOccupier'), function(x) { sum(is.na(x)) / length(x) * 100 })
+#    summarise_all(funs(mean(is.na(.)))) 
+#rownames(miss_percent)<-miss_percent$product_type
+
+df_inv<-data.frame(miss=miss_percent_inv,  var=names(miss_percent_inv), row.names=NULL)
+df_own<-data.frame(miss=miss_percent_own,  var=names(miss_percent_own), row.names=NULL)
+df_inv$pr_type<-'Investment'
+df_own$pr_type<-'OwnerOccupier'
+df_mis<-rbind(x=df_inv ,y=df_own)
+names(df_mis)<-c('pct','var', 'pr_type')
+
+df_mis%>%
+  ggplot(aes(x=var, y=pct, fill=pr_type)) + 
+  geom_bar(stat='identity', position=position_dodge()) +
+  labs(x='', y='% missing', title='Percent missing data by feature') +
+  scale_y_continuous(limits = c(0,100))+theme_bw()+
+  theme(axis.text.x=element_text(angle=90, hjust=1))
+    
+ 
+```
+Build_year variable has over 25% and about 70% of missings in new and secondary housing, respectively, so they should be replaced rather than dropped.Also there are abnormal values in build_year like 0, 215 or 4965 that should be replaced as well.  Moreover, purchase types have different range of years constructions.Investments were made in buildings erected between 1950th and 2015 with the peak in seventies, whereas buildings with OwnerOccupier product type are all new, though the most of information is unavailable. 
+
+```{r}
+  data_house%>%
+  ggplot(aes(x=as.factor(ceiling(build_year/5)*5)))+
+  geom_bar(stat='count')+
+  facet_grid(as.factor(product_type)~.)+
+  theme_bw()+
+  ggtitle('Distribution of year of construction per product type')+
+  theme(axis.text.x=element_text(angle=90, hjust=1))+xlab('build year')
+  
+```
+For Investments missings can be changed by the most frequently faced year that is equal to 1970. In case of OwnerOccupier buildings,  given the modern years in available data we can assume than nulls mean non-built properties yet. To test this hypothesis we visualize the number of nulls in build_year column versus year of transaction. Unfortunately, this idea was not confirmed by data, conversely, the closer years to nowadays, the more filled cells we have.
+
+Meantime, building the distribution of years difference between creation and purchase witnesses a tendency of buying own properties within two years period from construction. That means we will replace nulls in building years where product_type= OwnerOccupier by value of 'year' variable.
+```{r}
+data_house%>%filter(product_type=='Investment', build_year>1960, build_year<1990)%>%select(build_year)%>%table()
+
+data_house%>%filter(product_type=='OwnerOccupier')%>%
+mutate(b=is.na(build_year)*1)%>%
+  ggplot(aes(x=as.factor(year), y=b))+
+  geom_density(fill='blue', stat='summary', fun.y='mean')+
+  ggtitle('Distribution of nulls percentage by years for OwnerOccupier type ')
+  labs(x="build_year",y="Percent of nulls")
+
+data_house%>%mutate(year=as.integer(year))%>% mutate(year_dif=year-build_year)%>%filter(product_type=='OwnerOccupier')%>%
+  ggplot(aes(x=year_dif))+
+  geom_histogram(bins=10)+
+  scale_x_continuous(limits=c(-4,10), breaks=seq(-4,10,1))+
+  labs(x="age of apartments in year of transaction",y="Count")
+
+data_house<-data_house%>%
+  mutate(build_year=ifelse(is.na(build_year)|build_year<1800 |build_year>2016, ifelse(product_type=='Investment', 1970 ,as.numeric(year)),  build_year))
+         
+  
+ 
+```
+
+
+Next, we will look at 'Full square' variable, that is full area of property.It does not have missed values but kernel density plot shows presence of extreme values till 5000 sq metres where the most of data is concentrated around 50. It is also confirmed by percentiles meanings - 99% percent of data is less then 134 square metres. As dataset is quite big we will replace outliers by three standart deviations, following  the popular approach of treating them. In this case both product types show similar distribution of value and will be processed together.
+
+```{r}
+data_house%>%ggplot(aes(x=full_sq))+geom_density()+facet_grid(as.factor(product_type)~.)
+quantile(data_house$full_sq, c(0, 0.25, 0.5, 0.75,0.99, 1))
+```
+```{r}
+std_3=sd(data_house$full_sq)*3
+data_house<-data_house%>%mutate(full_sq=ifelse(full_sq>std_3,std_3,full_sq))
+```
+```{r}
+data_house%>%ggplot(aes(x=full_sq))+geom_density()+scale_x_continuous(limits=c(0,120), breaks=seq(0,150,10))
+```
+Number of rooms logically also seems to be an important price explonatory variable . It also has more than 25% of missings in column as well as extream values such as zero and 19.Graph below helps us identify 18 observations whose number of rooms are likely to be misspelling and should be replaced. As we suggested, price almost lineary increases with the number of rooms but after 9 the meaning decreases to the level of one-room property and then vary from one level to another without any understandable pattern. 
+
+```{r}
+print(max(data_house$num_room, na.rm=TRUE))
+print(min(data_house$num_room, na.rm=TRUE)) 
+```
+
+```{r}
+data_house%>%group_by(num_room)%>%
+  summarize(mean_price=mean(price_doc))%>%
+  ggplot(aes(x=num_room,y=mean_price))+
+  geom_bar(stat='identity')+
+  scale_x_continuous(limits=c(0,20), breaks=seq(0,20,1))+
+  ggtitle('Mean price by number of rooms ')+
+  theme_bw()+theme(axis.title = element_text(size=16),axis.text = element_text(size=14))+xlab("Number of rooms")+ylab("Price")
+```
+
+We also see strong linear relationships between full area of property and number of rooms on the diagram below. Once we changed all outliers in full area variable, we can use linear equitation to replace null and extreme values in 'number of room' column. Summary of linear regression model shows that sixty percent of variation of number of rooms can be explained by full area (R^2=61.31%). It is better than use average value.
+```{r}
+data_house%>%group_by(num_room)%>%
+  summarize(full_sq=mean(full_sq))%>%
+  ggplot(aes(x=num_room,y=full_sq))+
+  geom_point()+
+  stat_smooth(aes(x=num_room,y=full_sq),color="red",method="lm")+
+  scale_x_continuous(limits=c(0,10), breaks=seq(0,10,1))+
+  #scale_y_continuous(limits=c(0,300))+
+  theme_bw()+theme(axis.title = element_text(size=16),axis.text = element_text(size=14))+xlab("Number of rooms")+ylab("Full area")
+
+lin<-lm(num_room~full_sq,data=data_house%>%filter(!is.na(num_room), num_room>0, num_room<10))
+summary(lin)
+```
+
+Then we replace missings and extreme values with calculated linear equitation and round the result to get integer.
+```{r}
+data_house<-data_house%>%mutate(num_room=ifelse(is.na(num_room)|num_room==0|num_room>=10,round(coefficients(lin) [1]+full_sq*coefficients(lin)[2],0), num_room))
+
+data_house%>%
+  ggplot(aes(x=as.factor(num_room),y=full_sq))+
+  geom_boxplot()+
+  stat_smooth(aes(x=num_room,y=full_sq),color="red",method="lm", show.legend = TRUE)+
+  #scale_x_continuous(limits=c(0,10), breaks=seq(0,10,1))+
+  scale_y_continuous(limits=c(0,300))+
+  ggtitle('Relations between full area and number of rooms')+
+  theme_bw()+theme(axis.title = element_text(size=16),axis.text = element_text(size=14))+xlab("Number of rooms")+ylab("Full area")
+```
+After we filled in gaps in number of rooms, we can easily deal with Life_sq missings and outliers by replacing them with mean of living area in number of rooms bucket. It must enable more precise value than an average of the whole column. 
+
+First of all, we put distribution of number of rooms and life_square on graph where we may find out a stead growth of living space over all buckets.
+```{r}
+data_house%>%ggplot(aes(x=num_room, y=life_sq))+
+  geom_bar(stat='summary', fun.y='mean', fill='blue')+
+  scale_x_continuous(limits=c(1,10), breaks=seq(1,10,1))+
+  ggtitle('Distribution of average life area by number of rooms')+
+  theme_bw()+theme(axis.title = element_text(size=16),axis.text = element_text(size=14))+xlab("Number of rooms")+ylab("Life area")
+```
+Then we identify outliers using 99.5% quantile. Ultimetaly, they are values more than 123. Together with missings they will be replaced by buckets averages.
+```{r}
+quantile(data_house$life_sq, c(0.5, 0.7,0.995), na.rm=TRUE)
+```
+```{r}
+df_lf<-data_house%>%select(num_room, life_sq)%>%
+  drop_na()%>%group_by(num_room)%>%summarize(mn_life=mean(life_sq))
+data_house<-merge(data_house, df_lf, by='num_room')
+data_house<-data_house%>%mutate(life_squ=ifelse(is.na(life_sq)|life_sq>123,mn_life,life_sq))
+```
+
+
+```{r}
+data_house%>% ggplot(aes(x=life_squ, y=full_sq, group=1))+geom_point()+ggtitle('Relations between full_sq and life_sq')+
+  stat_smooth(color="red",method="lm", show.legend = TRUE)
+```
+While dealing with kitchen_sq missings and outliers we will use the same technique as for life_sq before. 
+```{r}
+
+data_house%>%
+  ggplot(aes(x=kitch_sq))+
+  geom_density(color='blue', fill='blue')+
+  facet_grid(as.factor(product_type)~.)+
+  scale_x_continuous(limits=c(0,50))+
+  labs(x="Kitchen area",y="Count")
+quantile(data_house$kitch_sq, c(0.5,0.75,0.995), na.rm=TRUE)
+
+sd3=sd(data_house$kitch_sq, na.rm=TRUE)*3
+med=median(data_house$kitch_sq, na.rm=TRUE)
+data_house<-data_house%>%mutate(kitch_sq=ifelse(is.na(kitch_sq),med, ifelse(kitch_sq>sd3, sd3,kitch_sq)))
+
+```
+
+Next, we process state and material variables describing property condition and wall matrial, respectively. Both probably contribute to pricing. At first, we change their types to factors, because in their case every number mean category. Moreover, boxplot diagram below that reflects distribution of price by state let us suppose state to likely be an ordinal caregorical variable because the median price slightly increases with a state value. Therefore, this variable will be ordered factor.
+
+```{r}
+  data_house%>%drop_na(state)%>%
+  ggplot(aes(x=as.factor(state),y=price_doc))+
+  geom_boxplot()+
+  ggtitle('Distribution of property price by state')
+```
+```{r}
+data_house<-data_house%>%
+  mutate(state=factor(state, order=TRUE),
+         material=as.factor(material)
+        )
+data_house<-data_house%>%mutate(state=ifelse(state==33,3,state))
+```
+Then we change missings by using the most frequent values. Almost all apartments with OwnerOccupier product type have first state, from which we can conclude that state=1 means new or empty. The weak variation of variable usually means that it will not be included to the range of explanatory variables of final model.
+```{r}
+data_house%>%
+  ggplot(aes(x=state))+geom_bar()+facet_grid(product_type~.)
+```
+Invested properties do not have state with the significantly higher number of observations as well as distribution of null values on the boxplot below represents median pricelower that this one of other states. That is why, we save null values as a fifth state equal to zero.
+```{r}
+data_house%>%filter(product_type=='Investment')%>%
+  ggplot(aes(x=as.factor(state), y=price_doc))+ggtitle('New distribution of property price by state')+geom_boxplot()
+
+data_house<-data_house%>%mutate(state=replace_na(state,0))
+```
+Calculation of median 'build_year' value by state shows that newest apartments in both product groups have state equal to 1, those constructed in 2000th have state equal to 4, finally, 2 and 3 status are declared to those built fifty years ago.The oldest buildings mostly do not have status - missed values . So it supports the idea to keep nulls in separate group.
+```{r}
+data_house%>%
+  ggplot(aes(x=state, y=as.numeric(build_year)))+geom_line(stat='summary', color='red', fun.y='median')+geom_point(stat='summary', fun.y='median')+facet_grid(product_type~.)+ggtitle('Median build year by state ')
+
+data_house$year_dif<-data_house$year-data_house$build_year
+```
+Once built distribution of material groups and mean price over them, we easily find out that missings can be replaced by 1. It does not affect price that is almost propertyten over states.
+
+```{r}
+data_house%>%
+  ggplot(aes(x=material))+geom_bar()+facet_grid(product_type~.)+ggtitle('Distribution of wall material groups')
+```
+```{r}
+data_house%>% ggplot(aes(x=material, y=num_room, group=1))+geom_line(stat='summary')+ggtitle('Relations between ')+scale_y_continuous(limits = c(0,5))
+
+data_house<-data_house%>%mutate(material=replace_na(material,1))
+```
+Last, we analyze floor data. The graph indicitaes a distribution skewed towards left that by the way, looks real -  most of properties are located not higher than 20th floor, and small percent of observations have property in range 20-70. There is therefore no neccessity to replace outliers.
+```{r}
+data_house%>%ggplot(aes(x=floor))+geom_histogram(bins=20)
+max(data_house$floor)
+```
+Mapping average price over floor no big differences between bins are noticed. However, slight increase of price after floor exceeded 14 is visible.
+```{r}
+data_house%>%ggplot()+
+  geom_bar(aes(x=floor,y=price_doc),stat="summary",fun.y="mean",fill="gray60")+
+  stat_smooth(aes(x=floor,y=price_doc),color="red")+
+  scale_x_continuous(limits=c(1,20))+scale_y_continuous(limits=c(0,2000000))+theme_bw()+theme(axis.title = element_text(size=16),axis.text = element_text(size=14))+xlab("Floor (floor)")+ylab("Price")
+```
+Such property trend says that we can replace missings with mean floor.
+```{r}
+m_fl=mean(data_house$floor, na.rm=TRUE)
+data_house<-data_house%>%mutate(floor=replace_na(floor,m_fl))
+```
+
+```{r}
+
+property_vars<-c('full_sq', 'life_squ', 'floor', 'material', 'build_year','year_dif', 'num_room','kitch_sq', 'state', 'price_new'  )
+table(sapply(data_house[,property_vars], class))
+
+```
+```{r}
+data_house<-data_house%>%mutate(
+    floor=as.integer(floor),
+    num_room=as.integer(num_room),
+    state=factor(state,ordered = TRUE)
+  )
+
+```
+Once we made all necessary transformations, we can carry out regression with price_new as dependable variable, and property_vars as independable. First, we build one model that includes product_type as a variable. Afterwards, we divide by two using type as a factor and compare results, especially focusing on R^-squared. 
+
+Results shows the in case of one model independable variables explain 41% of variation of target variable, whereas separately the model for investment product type shows r-squared equal to 44%  but model for new apartments only 40%.The weak relationship between build_year and price in second group may be a reason.  
+
+```{r}
+summary(lm(data=data_house[,property_vars], price_new~.))
+summary(lm(data=data_house[data_house$product_type=='Investment',property_vars], price_new~.))
+summary(lm(data=data_house[data_house$product_type=='OwnerOccupier',property_vars], price_new~.))
+```
+Anyway, the next question is how external variables will improve this result. Analysis of multicollinearityof variables and distribution residuals is not being carried out on this stage because this model is not final.
+
+# Analysis of variables describing region 
+
+Now we approach second group of variables that associated with area around the property. This group contains more than 200 parametres but we will check only those related to accessability of different facilities and leisure spots as well as estimated distances to public transport. 
+```{r}
+excl<-c('full_sq', 'life_squ', 'life_sq','floor', 'material', 'build_year','year_dif', 'num_room','kitch_sq', 'state',  'kitch_sq', 'mn_life','max_floor','area_m')
+
+data_region=select(data_house, -excl)
+```
+In contrast to the variables describing property, these have much less missings - 43 from 283, especially in the group of properties bought as investment. Almost all of them are linked with facilities available in the district, so we either will be able to fill in gaps by using data of other accomodations located at the same neighborhood or will admit, some of places did not provide some statistic at all.
+```{r}
+miss_percent_inv<-map_dbl(data_region%>%filter(product_type=='Investment'), function(x) { sum(is.na(x)) / length(x) * 100 })
+miss_percent_own<-map_dbl(data_region%>%filter(product_type=='OwnerOccupier'), function(x) { sum(is.na(x)) / length(x) * 100 })
+df_inv<-data.frame(miss=miss_percent_inv,  var=names(miss_percent_inv), row.names=NULL)
+df_own<-data.frame(miss=miss_percent_own,  var=names(miss_percent_own), row.names=NULL)
+df_inv$pr_type<-'Investment'
+df_own$pr_type<-'OwnerOccupier'
+df_mis<-rbind(x=df_inv ,y=df_own)
+names(df_mis)<-c('pct','var', 'pr_type')
+df_mis%>%mutate(if_missed=pct>0)%>%select(pr_type,if_missed)%>%table()
+df_mis%>%filter(pct>0)%>%
+  ggplot(aes(x=var, y=pct, fill=pr_type)) + 
+  geom_bar(stat='identity', position=position_dodge()) +
+  labs(x='', y='% missing', title='Percent missing data by feature') +
+  scale_y_continuous(limits = c(0,100))+theme_bw()+
+  theme(axis.text.x=element_text(angle=90, hjust=1))
+```
+To understand reasons of missings we visuasize them by sub-areas. Among 43 subareas containing nulls, 11 of them have in average more than fifty percent of missings across all data. Look at factors reveals us the high number of completely empty factors for some subareas, for example for such regions as Poselenie Mostrentgen and Poselenie Sharapovskoe the part of missed factors is about eighty percent that makes analysis of external factors on property in these areas almost impossible. That is why their observations have been removed from the dataset.
+```{r}
+
+col_mis<-as.character(unlist(unique(df_mis%>%filter(pct>0)%>%select(var))))
+df_sub_mis<-data_region[,append(col_mis,'sub_area')]%>%group_by(sub_area)%>%summarize_all(funs(mean(is.na(.))))
+df_sub_mis<-column_to_rownames(remove_rownames(df_sub_mis), var='sub_area')
+df_sub_mis<-transform(df_sub_mis, mean_mis=apply(df_sub_mis,1, mean))
+df_sub_mis<-transform(df_sub_mis, count_mis=apply(df_sub_mis,1, function (x) sum(x==1)))
+df_sub_mis<-rownames_to_column(df_sub_mis, var = "sub_area")
+
+```
+```{r}
+df_sub_mis%>%filter(mean_mis>0.05)%>%
+  ggplot(aes(x=sub_area, y=mean_mis))+geom_bar(stat='identity')+theme_bw()+
+  theme(axis.text.x=element_text(angle=90, hjust=1))+scale_y_continuous(limits = c(0,1), breaks=seq(0,1,0.1))+
+  labs(x='', x='sub_area',y='% missing', title='Average percent missing data by sub_area') 
+```
+```{r echo=FALSE}
+df_sub_mis%>%filter(count_mis>=1)%>%mutate(part_mis=count_mis/dim(df_sub_mis)[2])%>%
+  ggplot(aes(x=sub_area, y=part_mis))+geom_bar(stat='identity')+theme_bw()+
+  theme(axis.text.x=element_text(angle=90, hjust=1))+scale_y_continuous(limits = c(0,1), breaks = seq(0,1,0.1))+
+  labs(x='', x='sub_area',y='% missed factors', title='Percent of empty factors by sub_area') 
+```
+The criteria for shortening the number of nulls was to leave subareas that have no more than 30% of completely empty  factors. By this way,  we reduce the number of regions from 146 to 137.
+```{r echo=FALSE}
+sub_area_ok<-as.character(unlist(unique(df_sub_mis%>%mutate(part_mis=count_mis/dim(df_sub_mis)[2])%>%filter(part_mis<0.3)%>%select(sub_area))))
+data_region<-data_region%>%filter(sub_area %in% sub_area_ok)
+dim(data_region)
+```
+Next, the rest of missings will be changed by mean value in the districts. While we do not know if the region statistic was updated with the time, the hystoric dynamic of average value calculated for each column shows that mean does not change over time, that suggests the data was collected once. Although it is likely decrease explanatory ability of variables to explain price, it allows us to replace missings without considering 'year' variable.
+```{r, echo=FALSE} 
+data_region%>%group_by(sub_area, year)%>%summarize_all(funs(mean(as.numeric(.))))
+
+
+```
+
+```{r}
+data_region<-data_region %>% 
+  group_by(sub_area) %>% 
+  mutate_at(col_mis,na.aggregate)
+```
+After all transformations we still have 12 factors with missings. They are linked to the average price of cafes, the number of available places in hospitals and schools around, that seem potentially important for explaining price. 
+```{r}
+miss_percent_inv<-map_dbl(data_region%>%filter(product_type=='Investment'), function(x) { sum(is.na(x)) / length(x) * 100 })
+miss_percent_own<-map_dbl(data_region%>%filter(product_type=='OwnerOccupier'), function(x) { sum(is.na(x)) / length(x) * 100 })
+df_inv<-data.frame(miss=miss_percent_inv,  var=names(miss_percent_inv), row.names=NULL)
+df_own<-data.frame(miss=miss_percent_own,  var=names(miss_percent_own), row.names=NULL)
+df_inv$pr_type<-'Investment'
+df_own$pr_type<-'OwnerOccupier'
+df_mis<-rbind(x=df_inv ,y=df_own)
+names(df_mis)<-c('pct','var', 'pr_type')
+df_mis%>%mutate(if_missed=pct>0)%>%select(pr_type,if_missed)%>%table()
+df_mis%>%filter(pct>0)%>%
+  ggplot(aes(x=var, y=pct, fill=pr_type)) + 
+  geom_bar(stat='identity', position=position_dodge()) +
+  labs(x='', y='% missing', title='Percent missing data by feature') +
+  scale_y_continuous(limits = c(0,100))+theme_bw()+
+  theme(axis.text.x=element_text(angle=90, hjust=1))
+```
+Replacing gaps in variables described cafes around is not challenging task due to the range of variables like 'cafe_count_' that indicate amount of cafes within the certain distance from a property. When 'cafe_sum_' variables are nulls, these are all equal to zero meaning no cafes around. 
+For schools or hospitals dataset does not contain any other explanatory factors but we can presume the same motivation for their nulls.
+
+
+```{r}  
+data_region%>%filter(is.na(cafe_avg_price_1000))%>%
+  ggplot(aes(x=cafe_count_1000))+
+  geom_histogram(bins=20)
+```
+Missings can be replaced with zero because the diagrams below shows that such replacement does not destroy the observing growth of property price with average price in cafes around the property.We do not check all kind of variables suggesting their similarities
+```{r}
+data_region%>%mutate(cafe=ceiling(replace_na(cafe_avg_price_1000,0)/100)*100)%>%
+  ggplot(aes(x=cafe, y=price_doc))+geom_bar(stat='summary')+scale_x_continuous(limits=c(-500,3000))+scale_y_continuous(limits=c(0,15000000))+ stat_smooth(aes(x=cafe,y=price_doc),color="red")+ggtitle('Distribution of property price over bins of average price in cafes within 1 km' )
+
+data_region%>%mutate(cafe=ceiling(replace_na(cafe_avg_price_500,0)/100)*100)%>%
+  ggplot(aes(x=cafe, y=price_doc))+geom_bar(stat='summary')+scale_x_continuous(limits=c(-500,3000))+scale_y_continuous(limits=c(0,15000000))+ stat_smooth(aes(x=cafe,y=price_doc),color="red")+ggtitle('Distribution of property price over bins of average price in cafes within 500 metres' )
+```
+```{r}
+col_mis1<-as.character(unlist(unique(df_mis%>%filter(pct>0)%>%select(var))))
+#data_region<-
+data_region[col_mis1][is.na(data_region[col_mis1])]<- 0
+```
+
+
+## Bivariate analysis of external variables
+
+Now when we do not have missing values any more, we can analyze the ability of separate variables describing area around the property to explain the price . Starting with those depicting number of facilities within 500 and 1000 metres from apartment we find out low level of correlation between price and any of tested explanatory variables- maximum value is equal to 0.16.Some of the results are worth commenting on. 
+
+First,  the stongest individual explanatory ability is found out for such factors as number of offices, leisure and sport facilites. 
+
+Second, variables green_part and prom_part, which mean share of green area and industrial zone in a region respectively, have negative correlation with price. While we expect negative influence of presence of industrial zone in apartment surroundings, being located not far from parks seems a good indicator, so at first glance, its negative impact on price looks strange. However negative correlation with other variables, evidently associated with urban area give us a clue about suburban and maybe even countryside areas in dataset that do not house a lot of facilities and located faraway from the city centre. We come back to verify this presumption later.
+
+Next point that deserves attention is the fact that among variables which have stronger correlation with price those describing facilities within 500 metres mostly outweight those describing facilities within 1000 metres but it is opposit for weakly correlated features. Possibly, it happens because second group represent less popular public places like mosques or markets. 
+
+```{r}
+library(grid)
+asNumeric <- function(x) as.numeric(x)
+factorsNumeric <- function(d) modifyList(d, lapply(d[, sapply(d, is.factor)],   
+                                                   asNumeric))
+#library(gridExtra)
+data_region<-ungroup(data_region)
+#as.data.frame(cor(factorsNumeric(data[property_vars])))
+par(mfrow=c(1,2))
+df_ch1<-cor(factorsNumeric(data_region%>%select(c(one_of("price_doc"),matches('*count_500$'),matches('*part_500$')))))
+c1<-corrplot(df_ch1, tl.cex=0.6)
+df_ch2<-cor(factorsNumeric(data_region%>%select(c(one_of("price_doc"),matches('*count_1000$'),matches('*part_1000$')))))
+c2<-corrplot(df_ch2, tl.cex=0.6)
+df_ch<-cor(factorsNumeric(data_region%>%select(c(one_of("price_doc"),matches('*count_500$'),matches('*part_500$'),matches('*count_1000$'),matches('*part_1000$')))))
+var0<-which(abs(df_ch[,1])>=0.1)
+```
+Remarkably, the opossite to the third finding trend can be observed in variables that depict average price in facilites around. The more distance the higher corellation with price. So statistics about facilities within 5km explain price by the best way where average price in cafes are best correlated with apartment price. Possibly, the higher distance better explain the wealth of regions, though that is still small in scale of Moscow and hardly cover any of subareas comppletely.
+```{r}
+library(grid)
+#library(gridExtra)
+#data_region<-ungroup(data_region)
+par(mfrow=c(1,2))
+df_ch1<-cor(data_region%>%select(c(one_of("price_new"),matches('cafe_avg*'))))
+c1<-corrplot(df_ch1, tl.cex=0.6)
+df_ch2<-cor(data_region%>%select(c(one_of("price_new"),matches('cafe_sum*'))))
+c2<-corrplot(df_ch2, tl.cex=0.6)
+df_ch<-cor(data_region%>%select(c(one_of("price_new"),matches('cafe_avg*'),matches('cafe_sum*'))))
+var1<-which(abs(df_ch[,1])>=0.1)
+sort(abs(df_ch[,1]), decreasing = TRUE)
+```
+
+Turning back to the second suggestion, the visualization of distribution of average price over 10 percentiles of 'part of green area within 1 km variable confirms it. We can observe sharp upward trend in price from 0 to 5 per cent of green cover as well as dramatic decrease of it after green area exceeds 20%. In the middle there are fluctuations that are probably can be explained by other variables.
+```{r}
+data_region%>%mutate(gp_1000=cut(green_part_1000, breaks=quantile(green_part_1000, probs=seq(0,1,0.1)), include.lowest = TRUE,labels = NULL))%>%
+  ggplot(aes(x=gp_1000,y=price_new, group=1))+
+  geom_line(stat='summary')+geom_point(stat='summary')
+
+```
+Apart from presence of public spaces, accessability of such services as schools, universities or hospitaks in a district('raion') may make price higher.That is why, the correlation between these variables and price was measured. Interestingly, though we do not how big districts are, variables that describe them in a way 'yes'/'no' have stronger relations with property price than exact number in exact distance. Again sport facilities are higher than others correlated with price. Also, districts housing top Universities are more expencive in terms of cost of accomodation.  Among other findings, relationships between number of schools and healthcare centres as well as sport objects. Probably, they are associated with residential areas that well equipped by facilities necessary for families.
+```{r}
+asNumeric <- function(x) if_else(as.character(x)=='no',0,1)
+factorsNumeric <- function(d) modifyList(d, lapply(d[, sapply(d, is.factor)],   
+                                                   asNumeric))
+df <- factorsNumeric(data_region%>%select(c(one_of("price_doc"),matches('*raion$'))))
+```
+```{r}
+  corrplot(cor(df)[which(abs(cor(df)[,1])>=0.1),which(abs(cor(df)[,1])>=0.1)],tl.cex=0.6)
+
+var2<-which(abs(cor(df)[,1])>=0.1)
+```
+  
+
+We do not have variable that indicates if a property is located inside the city  but a little knowledge of Moscow geography will help us to extract some valuable information about area remotness from given factors. In dataset there are mkad_km and kremlin_km variables that indicate distance of place from 'mkad' (Moscow Circle Auto Road) that is practically a border between the city of Moscow and its suburbs- and from kremlin - the residence of the president that is considered the centre of Moscow. 
+
+The diagram below shows that price of accomodation gradually decrease with the distance from Kremlin, aka Moscow centre.
+```{r}
+data_region%>%
+  ggplot(aes(x=kremlin_km,y=price_doc))+
+  geom_point(stat='identity')+stat_smooth(color='red', method='gam')+ggtitle('Relationship between price and distance from Kremlin' )
+
+```
+
+Although the distance from the Circle Road does not indicate if an apartment is in or out of it, kremlin_km feature allows us to roughly calculate it. Once we know the average distance from kremlin to accomodations close to mkad, that technicaly is a radius of the circle, we will be able to differ inside and outside locations, simply by comparing this measure with the remotness of a property from kremlin.
+
+As distance from located next to 'mkad' properties is almost normally distributed, the 95% percent confidence interval was calculated to understand limits of possible threshold. The interval happened to be quite tight - about 90 metres,  so we can use upper limit as a Moscow boarded. New variable 'is_urban' was therefore created based on it. 
+```{r}
+data_region%>%filter(mkad_km<2)%>%ggplot(aes(x=kremlin_km))+geom_histogram(bins=50)+ggtitle('Distribution of distance from apartments located close to "mkad" to kremlin')
+n=dim(data_region%>%filter(mkad_km<2))[1]
+s=sd(unlist(data_region%>%filter(mkad_km<2)%>%select(kremlin_km)))
+error = qnorm(0.975)*s/sqrt(n)
+m=mean(unlist(data_region%>%filter(mkad_km<2)%>%select(kremlin_km)))
+left=m-error
+right=m+error
+left
+right
+```
+According to t-test there is a statistical significant difference in prices inside and outside the circle road
+```{r}
+var3<-c('kremlin_km','mkad_km','is_urban')
+data_region<-data_region%>%mutate(is_urban=if_else(kremlin_km<=15.85,1,0))
+```
+```{r}
+t.test(log(unlist(data_region%>%filter(is_urban==1)%>%select(price_new))),log(unlist(data_region%>%filter(is_urban==0)%>%select(price_new) )))
+```
+However diagrams almost does not demonsrate big difference between two types of location.
+```{r}
+data_region%>%ggplot(aes(x=price_new*100))+geom_density()+facet_grid(as.factor(is_urban)~.)+scale_x_continuous(limit=c(99,101))
+```
+Along with closeness to centre, the distance from public transpot should be important, especially for those who live in Moscow suburbs. At the same time, despite correlation matrix supports negative association between property price and distance to a transport station, the strength of correlation was expected to be bigger.The highest correlation are between property price in suburb and its distance to railway('zd_vokzaly_avto_km') and bus stations.It is expained by daily need to use this transport for commuting - dataset has no separate information about commuter train stations, so we may assume it is added to the first variable). Unexpectedly, metro proximity does not have a lot of impact on price,even iside the city, maybe because of the fact that now it is equally spread over all Moscow area, so other rare factors contribute better. Last, we can see high correlation between variables of distance from metro, railway and bus station. It means that in the city they are often located close to each other, creating transport hubs.  
+
+```{r}
+pt_vars<-c('railroad_km','public_transport_station_km','zd_vokzaly_avto_km','bus_terminal_avto_km', 'metro_km_walk')
+df_pt <- data_region%>%select(c(one_of("price_doc"),pt_vars, is_urban))
+```
+```{r}
+  par(mfrow=c(1,2))
+  corrplot(cor(df_pt%>%filter(is_urban==0))[-7,-7], tl.cex=0.6)
+  corrplot(cor(df_pt%>%filter(is_urban==1))[-7,-7], tl.cex=0.6)
+
+#var5<-which(abs(cor(df_pt)[,1])>=0.1)
+```
+
+# Linear regression modeling
+
+Once we have analyzed all variables, it is time to merge two datasets together and build linear regression
+```{r}
+property_vars<-c('full_sq', 'life_squ', 'floor', 'material', 'num_room','kitch_sq', 'state', 'price_new', 'product_type' )
+data_region_fin<-as.data.frame(data_region%>%select (c(var0, var1, var2,var3,pt_vars, green_part_1000, id)))
+data<-as.data.frame(merge(data_house[c(property_vars,'id')],data_region_fin, by='id'))
+str(data)
+```
+Some numeric factors mistakenly were recognised as factors by program, so before running model, they should be transformed to numeric
+```{r}
+  data<-data%>%mutate(
+  cafe_avg_price_1500=as.numeric(cafe_avg_price_1500),
+  cafe_avg_price_500=as.numeric(cafe_avg_price_500),
+  is_urban=as.factor(is_urban),
+  school_education_centers_raion=as.numeric(school_education_centers_raion),
+  sport_count_1000=as.integer(sport_count_1000)
+  )
+```
+
+Adding all new variables to the first model improves R-squared on 7%. However several variables such as num_room,university_top_20_raion, metro_km_walk have changed the sign because of multicolleniarity that is counterintuitive, so we should solve this problem.
+```{r}
+model<-lm(data=data[-1], price_new~.)
+summary(model)
+```
+For this purpose we will steadly exclude values that are highly correlated with those which better than them explain variation of dependable variable.
+
+We start with variables that describe property. We can see that life_sq and num_room have high correlation with full_sq. So we remove them from model and try linear regression again 
+```{r}
+data$school_education_centers_raion<-NULL
+asNumeric <- function(x) as.numeric(as.character(x))
+factorsNumeric <- function(d) modifyList(d, lapply(d[, sapply(d, is.factor)],asNumeric))  
+
+df_num<-as.data.frame(cor(factorsNumeric(data[property_vars])))
+#df_num[is.na(df_num)]<-0
+df_num<-df_num[order(-abs(df_num$price_new)), order(-abs(df_num$price_new))]
+corrplot(as.matrix(df_num))
+#order<-rownames(as.data.frame(sort(cor(df_num)[,'price_new'], decreasing = TRUE)))
+#cor(factorsNumeric(data))[which(abs(cor(factorsNumeric(data)))[,'price_new'])>=0.1)]
+```
+```{r}
+  drop_vars<-c('num_room','life_squ')
+  summary(lm(data$price_new~., data=data[ , -which(colnames(data) %in% c(drop_vars,'price_new'))]))
+```
+Next, the correlation of variables describing location is being performed. Ordering from high to low correlation with dependable variablehallow us to select highly correlated with price and not associated with  each other variables by choosing only those in matrix that contain high coefficients values only to the right side of the main diagonal 
+```{r}
+
+df_num<-as.data.frame(cor(factorsNumeric(merge(data_region_fin, data[c('id','price_new')], by='id'))))
+df_num[is.na(df_num)]<-0
+df_num<-df_num[order(-abs(df_num$price_new)), order(-abs(df_num$price_new))]
+#df_num<-df_num[order(-abs(df_num$price_new))]
+corrplot(as.matrix(df_num), tl.cex=0.6)
+```
+```{r}
+drop_vars<-c(drop_vars, 'kremlin_km', 'bus_terminal_auto','cafe_sum_1000_min_price_avg', 'cafe_sum_500_max_price_avg', 'incineration_raion', 'university_top_20_raion',
+'cafe_sum_1000_max_price_avg', 'cafe_sum_1500_max_price_avg', 'sport_objects_raion','cafe_avg_price_500', 'cafe_sum_5000_max_price_avg')
+summary(lm(data$price_new~., data=data[ , -which(colnames(data) %in% c(drop_vars,'price_new','id'))]))
+```
+Next, we calculate Variance inpropertyion factor to detect independable variables that can be explained by range of other independable variables. We drop all variables where VIF is equal or higher than 8 and in our case it is 'zd_vokzaly_avto_km' variable.
+```{r}
+vif(lm(data$price_new~., data=data[ , -which(colnames(data) %in% c(drop_vars,'price_new','id'))]))
+```
+Along with 'zd_vokzaly_avto_km ' we decrease number of levels in factor 'material'. Also we notice weak explanatory ability of kitchen area, that is why, new variable 'part_kitchen' that means part of property that takes kitchen was created in attempt to strengthen model
+```{r}
+
+data$is_material4<-factor(as.character(data$material==4), levels=c('FALSE','TRUE'), labels=c(0,1))
+data$part_kitchen<-data$kitch_sq/data$full_sq
+dro_vars<-c(drop_vars,'zd_vokzaly_avto_km','material', 'kitch_sq','hospital_beds_raion')
+#dro_vars<-c(drop_vars,'cafe_sum_3000_max_price_avg','bus_terminal_avto_km','kitch_sq', 'material','cafe_sum_5000_min_price_avg', )
+summary(lm(data$price_new~., data=data[ , -which(colnames(data) %in% c(dro_vars,'price_new','id'))]))
+```
+'Part kitchen' indeed happened to be significant. Now, all variables have explicable direction of relationship with price. Warnings are possible about 'cafe_avg_price_1500' that have a negative sign but we can make assumption that low average price means prevailing number of fast food restaurants around that usually imply shopping malls, cinema etc that, ultimetly positevly influence living conditions, thus increasing price. 
+```{r}
+ok_vars<-colnames(data)[-which(colnames(data) %in% c(dro_vars,'id') )]
+property_vars_new<-c('full_sq','is_material4','part_kitchen')
+```
+After building model we continue to check if standard linear model assumptions are justified.
+
+For theoretical regression erros are assumed to be normally distributed but in our case QQ-plot shows that standardized residuals do not follow normal distribution because points do not properly match the line and histogram is a bit skewed.
+```{r}
+model<-lm(data$price_new~., data=data[ , -which(colnames(data) %in% c(dro_vars,'price_new','id'))])
+summary(model)
+plot(model, which=2)
+hist(rstandard(model))
+```
+
+We run RESET test to check if our model is correctly specified that is our null hypothesis. Test results present misspisification because p-value is less than threshold, hence we have to reject null hypothesis.
+```{r}
+library(lmtest)
+resettest (model)
+```
+Possibly, it is outliers that cause problems with the specification.However according to Residuals versus Leverage plot none of otliers influence the model
+
+```{r}
+plot(model, which=5)
+```
+
+Plotting residuals versus predicted variable reveals a fair pattern that means the presence of heteroskedasticity.
+
+```{r}
+plot(model, which=3)
+```
+Bptest test helps to verify this output. Again, p-value is less than 0.05, so the presence of heteroskedasticity is confirmed.
+```{r}
+bptest(model)
+```
+Summing up results of tests, we have three problems with model: 
+ - mispecification of model( non-linearity)
+ - not normal distribution of residuals
+ - heteroskedosticity
+
+We can try non-linear transformations or transformation of outliers  to solve problems
+
+First we try to model logarithm of property price. However residuals plots show taking logarithm does not improve results
+```{r}
+#data1<-data%>%mutate_if(is.numeric,log)
+#data1[data1==-Inf]<--1000000
+property_vars_new<-c( "full_sq","floor","state", "product_type","is_material4","part_kitchen" )
+model1<-lm(log(data$price_new)~., data=data[, property_vars_new])
+summary(model1)
+par(mfrow=c(2,2))
+plot(model1)
+#hist(rstandard(model1))
+```
+Next we can still try to decrese heteroskedosticity by removing influential outliers selected by following rool : cook distance>4/N, where N is number of rows in the dataset. In total, 5 percent of observations were named influential and were removed.
+```{r}
+thresh=4/dim(data)[1]
+data$cook_property<-cooks.distance(model1)
+data['is_inf']<-as.numeric(data$cook_property>thresh)
+mean(data$is_inf)
+```
+It did significant progress. First, pattern in ploting residuals versus fitted values got less  Second, removing outliers noticably increased r squares from 47% till 55%. The negative point is it changed the sign of sport_count_1000 variable, so we need again to deal with multicollinearity. Also standardized residuals still do not follow normal distribution.
+```{r}
+data_no_inf<-data%>%filter(is_inf==0)
+model_ninf<-lm(data_no_inf$price_new~., data=data_no_inf[ , ok_vars])
+summary(model_ninf)
+par(mfrow=c(2,2))
+plot(model_ninf)
+#hist(rstandard(model1))
+```
+All variables which did not significantly improve model ( p_value>0.05) were removed.
+```{r}
+ok_vars1<-ok_vars[-which(ok_vars %in% c('cafe_sum_3000_max_price_avg','bus_terminal_avto_km','product_type', 'cafe_sum_5000_min_price_avg', 'sport_count_1000' ))]
+ok_vars1
+```
+The final OLS model draws on 17 variables,four related to property conditions, 13 related to location, that together describe 54 percents of housing price variation in Moscow region.
+Model still does not pass RESET test. Now it says that relationship between housing price and internal and external factors that we test is non-linear. Possibly it can be solved by making model more complex or adding new variables.
+```{r}
+model_ninf<-lm(data_no_inf$price_new~., data=data_no_inf[ , ok_vars1])
+summary(model_ninf)
+par(mfrow=c(2,2))
+plot(model_ninf)
+hist(rstandard(model_ninf))
+```
+```{r}
+resettest (model_ninf)
+```
+This paper has  two outcomes:
+
+First , relying on R-squared value we justified the importance of location associated factors, such as distance to public transport station or amount of offices in a distrinct in housing pricing in Moscow. 
+
+Second, we should conclude that prices in housing market are changing non-lineary with both internal and external factor, though price relationship with some of them like full area of property is very close to linear.  
